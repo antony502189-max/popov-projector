@@ -61,6 +61,7 @@ class Player:
         self.ready = False
         self.error = None
         self.exit = False
+        self.visitor_server = None
 
     def status(self):
         return dict(ready=self.ready, stopped=self.stopped, waiting=len(self.tasks),
@@ -103,20 +104,26 @@ class Player:
                         if index == 0:
                             if time.time() > expiry: raise ValueError("Истёк срок команды")
                             record.update(state="prepared", chunks=len(chunks), played_chunks=0, first_cached=cached)
+                        if record.get("visitor"):
+                            # Align this portrait track with the same scheduled PCM as the projector.
+                            offset = record.get("samples", 0) / 22050
+                            poses = record.setdefault("poses", [])
+                            poses.extend([round(offset + a, 3), pose] for a, _, pose in track["cues"])
+                            poses.append([round(offset + track["seconds"], 3), "rest"])
                         record["samples"] = record.get("samples",0) + len(pcm)//2
                         output(dict(type="play", id=key, index=index, last=index==len(chunks)-1,
                                     **track, expiry=expiry), pcm)
             except Exception as exc:
                 with self.lock:
                     if self.active == key:
-                        self.history[key].update(state="failed", reason=str(exc))
+                        self.history[key].update(state="failed", reason=str(exc), ended_at=time.monotonic())
                         self.active = None
                         output(dict(type="abort", id=key, message=str(exc)))
 
     def cancel(self):
-        for key, *_ in self.tasks: self.history[key]["state"] = "cancelled"
+        for key, *_ in self.tasks: self.history[key].update(state="cancelled", ended_at=time.monotonic())
         self.tasks.clear()
-        if self.active: self.history[self.active]["state"] = "cancelled"
+        if self.active: self.history[self.active].update(state="cancelled", ended_at=time.monotonic())
         self.active = None
         self.lock.notify_all()
 
@@ -125,10 +132,23 @@ class Player:
             cmd = msg.get("command")
             key = msg.get("id", "")
             if not isinstance(key, str) or len(key) > 128: raise ValueError("Некорректный id")
+            if cmd == "visitors":
+                from visitor import start, visitor_url
+                try:
+                    if self.visitor_server is None:
+                        self.visitor_server = start(self, os.environ.get("POPOV_VISITOR_BIND", "0.0.0.0"),
+                                                    int(os.environ.get("POPOV_VISITOR_PORT", "8765")))
+                    url = visitor_url(self.visitor_server)
+                except (OSError, ValueError) as exc:
+                    message = "Не удалось открыть вход для посетителей: " + str(exc)
+                    if internal: output(dict(type="error", message=message))
+                    raise ValueError(message) from exc
+                output(dict(type="visitors", url=url, open=internal))
+                return {"url": url}
             if cmd == "status": return self.status()
             if cmd == "event":
                 record = self.history.get(key)
-                return {"state":"unknown"} if not record else {k:v for k,v in record.items() if k not in ("digest","received")}
+                return {"state":"unknown"} if not record else {k:v for k,v in record.items() if k not in ("digest","received","ended_at","visitor","poses","started_at")}
             if cmd == "stop":
                 self.stopped = True
                 self.cancel()
@@ -141,12 +161,15 @@ class Player:
                     record = self.history[key]
                     if cmd != "played": record["state"] = cmd
                     if cmd == "started":
+                        record["started_at"] = time.monotonic()
                         record["started_ms"] = round((time.monotonic()-record["received"])*1000)
                         output(dict(type="timing", ms=record["started_ms"]))
                     elif cmd == "played":
                         record["played_chunks"] = max(record["played_chunks"], int(msg["index"])+1)
                         record["underruns"] = int(msg.get("underruns",0))
-                    else: self.active = None
+                    else:
+                        record["ended_at"] = time.monotonic()
+                        self.active = None
             elif cmd in ("say", "ask"):
                 speech = msg.get("text")
                 if not isinstance(speech, str) or not speech.strip() or len(speech)>(400 if cmd=="ask" else MAX_TEXT):
@@ -212,6 +235,9 @@ def main():
             result = request(line,True)
             if result.get("error"): output(dict(type="error",message=result["error"]))
     finally:
+        if player.visitor_server is not None:
+            player.visitor_server.shutdown()
+            player.visitor_server.server_close()
         server.server_close()
         SOCKET.unlink(missing_ok=True)
 

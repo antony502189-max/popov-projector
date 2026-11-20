@@ -14,7 +14,7 @@ def send(msg):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("command", choices=["say","ask","status","event","stop","resume"])
+    p.add_argument("command", choices=["say","ask","status","event","stop","resume","visitors"])
     p.add_argument("text", nargs="?")
     p.add_argument("--file",type=Path,help="Прочитать UTF-8 текст из файла")
     p.add_argument("--interrupt",action="store_true",help="Прервать текущий рассказ и сразу ответить")

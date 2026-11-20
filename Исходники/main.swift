@@ -1,5 +1,6 @@
 import AppKit
 import SpriteKit
+import CoreImage
 import AVFoundation
 
 typealias Message = [String: Any]
@@ -12,7 +13,7 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let bench = CommandLine.arguments.contains("--test-player")
     var activity: NSObjectProtocol?
     let root = Bundle.main.bundleURL.deletingLastPathComponent()
-    let panel = NSWindow(contentRect: NSRect(x:0,y:0,width:610,height:475), styleMask:[.titled,.closable,.miniaturizable], backing:.buffered, defer:false)
+    let panel = NSWindow(contentRect: NSRect(x:0,y:0,width:610,height:515), styleMask:[.titled,.closable,.miniaturizable], backing:.buffered, defer:false)
     let text = NSTextField(string:"Здравствуйте. Меня зовут Александр Степанович Попов.")
     let status = NSTextField(labelWithString:"Загружается русский голос…")
     let timing = NSTextField(labelWithString:"")
@@ -31,6 +32,9 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var avatar: Avatar!
     let stream = StreamAudio()
     var activeID: String?
+    var visitorURL: URL?
+    var visitorCard: NSView?
+    let visitorLink = NSTextField(labelWithString: "")
     var targetScreen: NSNumber?
     var ready = false, stopped = false, closing = false
     var monitor: Any?
@@ -125,6 +129,8 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sendButton.action = #selector(say); sendButton.isEnabled = false
         let halt = button("СТОП  ⎋",#selector(stop)); halt.contentTintColor = .systemRed
         stack.addArrangedSubview(row([sendButton,button("Перебить",#selector(interrupt)),halt,button("Возобновить",#selector(resume))]))
+        stack.addArrangedSubview(row([button("Приложение посетителя",#selector(openVisitor)),visitorLink]))
+        visitorLink.isSelectable=true; visitorLink.textColor = .secondaryLabelColor
         status.lineBreakMode = .byTruncatingTail; stack.addArrangedSubview(status)
         timing.textColor = .secondaryLabelColor; stack.addArrangedSubview(timing)
         panel.center(); panel.makeKeyAndOrderFront(nil)
@@ -180,7 +186,32 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let surface=SKView(frame:NSRect(origin:.zero,size:initial.size))
         surface.ignoresSiblingOrder=false; surface.preferredFramesPerSecond=60
         surface.autoresizingMask=[.width,.height]; out.contentView=surface; surface.presentScene(avatar)
-        window=out; out.orderFront(nil); panel.makeKeyAndOrderFront(nil)
+        window=out; showVisitorCode(); out.orderFront(nil); panel.makeKeyAndOrderFront(nil)
+    }
+
+    @objc func openVisitor() { send(["command":"visitors"]) }
+
+    func showVisitorCode() {
+        visitorCard?.removeFromSuperview()
+        guard let url=visitorURL, let surface=window?.contentView, !stopped,
+              let filter=CIFilter(name:"CIQRCodeGenerator") else { return }
+        filter.setValue(Data(url.absoluteString.utf8),forKey:"inputMessage")
+        filter.setValue("M",forKey:"inputCorrectionLevel")
+        guard let code=filter.outputImage?.transformed(by:CGAffineTransform(scaleX:6,y:6)),
+              let image=CIContext().createCGImage(code,from:code.extent) else {return}
+        let card=NSView(frame:NSRect(x:16,y:16,width:188,height:184))
+        card.wantsLayer=true; card.layer?.backgroundColor=NSColor.white.cgColor
+        let qr=NSImageView(frame:NSRect(x:29,y:42,width:130,height:130))
+        qr.image=NSImage(cgImage:image,size:code.extent.size); qr.imageScaling = .scaleProportionallyUpOrDown
+        let caption=NSTextField(labelWithString:"Спросить Попова")
+        caption.alignment = .center; caption.textColor = .black
+        caption.frame=NSRect(x:3,y:23,width:182,height:18)
+        let shortAddress = (url.host ?? "") + (url.port.map { ":" + String($0) } ?? "")
+        let address=NSTextField(labelWithString:shortAddress)
+        address.alignment = .center; address.textColor = .darkGray
+        address.font = .systemFont(ofSize:10); address.frame=NSRect(x:2,y:4,width:184,height:16)
+        card.addSubview(qr);card.addSubview(caption);card.addSubview(address)
+        surface.addSubview(card);visitorCard=card
     }
 
     @objc func calibrate() {
@@ -250,7 +281,7 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let token=activity { ProcessInfo.processInfo.endActivity(token); activity=nil }
     }
     func blackout() {
-        stopped=true; avatar?.flashUntil=0; reference.layer?.backgroundColor=NSColor.black.cgColor; clearAudio(); avatar?.blank=true; editGrid.state = .off; avatar?.calibrating=false
+        stopped=true; visitorCard?.removeFromSuperview(); avatar?.flashUntil=0; reference.layer?.backgroundColor=NSColor.black.cgColor; clearAudio(); avatar?.blank=true; editGrid.state = .off; avatar?.calibrating=false
         sendButton.isEnabled=false; status.stringValue="СТОП · звук выключен, поле чёрное"
     }
     @objc func stop() { blackout(); send(["command":"stop"]) }
@@ -262,6 +293,10 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard !closing, let type=msg["type"] as? String else {return}
         switch type {
         case "ready": ready=true; sendButton.isEnabled = !stopped; if !stopped { status.stringValue="Готов к реплике" }
+        case "visitors":
+            guard let link=msg["url"] as? String, let url=URL(string:link) else {return}
+            visitorURL=url; visitorLink.stringValue=link; showVisitorCode()
+            if msg["open"] as? Bool == true { NSWorkspace.shared.open(url) }
         case "stop": blackout()
         case "interrupt": clearAudio()
         case "abort":
@@ -269,7 +304,7 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
             status.stringValue=msg["message"] as? String ?? "Ошибка синтеза"
         case "resume":
             guard bench || window?.isVisible == true else { stop(); return }
-            stopped=false; avatar.blank=false; sendButton.isEnabled=ready; status.stringValue=ready ? "Готов к реплике" : "Загружается голос…"
+            stopped=false; showVisitorCode(); avatar.blank=false; sendButton.isEnabled=ready; status.stringValue=ready ? "Готов к реплике" : "Загружается голос…"
         case "timing": if let ms=msg["ms"] as? Int { timing.stringValue="От приёма текста до запуска звука: "+String(ms)+" мс" }
         case "error": status.stringValue=msg["message"] as? String ?? "Ошибка"
         case "play":
