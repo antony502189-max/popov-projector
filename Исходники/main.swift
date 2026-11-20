@@ -11,11 +11,12 @@ final class OutputWindow: NSWindow {
 
 final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let bench = CommandLine.arguments.contains("--test-player")
+    let offline = CommandLine.arguments.contains("--offline")
     var activity: NSObjectProtocol?
     let root = Bundle.main.bundleURL.deletingLastPathComponent()
     let panel = NSWindow(contentRect: NSRect(x:0,y:0,width:610,height:515), styleMask:[.titled,.closable,.miniaturizable], backing:.buffered, defer:false)
     let text = NSTextField(string:"Здравствуйте. Меня зовут Александр Степанович Попов.")
-    let status = NSTextField(labelWithString:"Загружается русский голос…")
+    let status = NSTextField(labelWithString:"Запускается показ…")
     let timing = NSTextField(labelWithString:"")
     let displays = NSPopUpButton()
     let scale = NSSlider(value:0.9,minValue:0.30,maxValue:1.05,target:nil,action:nil)
@@ -34,6 +35,13 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var activeID: String?
     var visitorURL: URL?
     var visitorCard: NSView?
+    var visitorExpires = 0.0
+    var qrTimer: Timer?
+    var serverMode: Bool {
+        guard !offline else { return false }
+        return ProcessInfo.processInfo.environment["POPOV_SERVER_URL"] != nil ||
+        FileManager.default.fileExists(atPath: root.appendingPathComponent("station.env").path)
+    }
     let visitorLink = NSTextField(labelWithString: "")
     var targetScreen: NSNumber?
     var ready = false, stopped = false, closing = false
@@ -60,10 +68,17 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
             refreshScreens()
             openOutput()
             if bench { window?.orderOut(nil); panel.orderOut(nil) }
+            else if serverMode && !CommandLine.arguments.contains("--test-panel") { panel.orderOut(nil) }
             else { panel.makeKeyAndOrderFront(nil) }
             launchWorker()
         } catch { status.stringValue = error.localizedDescription }
         if !bench { NSApp.activate(ignoringOtherApps:true) }
+        qrTimer = Timer.scheduledTimer(withTimeInterval:1,repeats:true) { [weak self] _ in
+            guard let self=self else { return }
+            if self.visitorExpires > 0 && Date().timeIntervalSince1970 >= self.visitorExpires {
+                self.visitorCard?.removeFromSuperview(); self.visitorURL=nil
+            }
+        }
         NotificationCenter.default.addObserver(self,selector:#selector(screensChanged),name:NSApplication.didChangeScreenParametersNotification,object:nil)
         NSWorkspace.shared.notificationCenter.addObserver(self,selector:#selector(stop),name:NSWorkspace.willSleepNotification,object:nil)
         NSWorkspace.shared.notificationCenter.addObserver(self,selector:#selector(stop),name:NSWorkspace.sessionDidResignActiveNotification,object:nil)
@@ -88,7 +103,7 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func buildPanel() {
-        panel.title = "Город говорит · Пульт проектора"
+        panel.title = "Город говорит · Тестовый пульт"
         panel.isReleasedWhenClosed = false
         panel.delegate = self
         let stack = NSStackView()
@@ -146,6 +161,7 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
             displays.lastItem?.representedObject = screenID(screen)
         }
         if let old = old, let item = displays.itemArray.first(where:{ ($0.representedObject as? NSNumber) == old }) { displays.select(item) }
+        else if serverMode && NSScreen.screens.count > 1 { displays.selectItem(at:2) }
     }
 
     @objc func screensChanged() {
@@ -186,20 +202,34 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let surface=SKView(frame:NSRect(origin:.zero,size:initial.size))
         surface.ignoresSiblingOrder=false; surface.preferredFramesPerSecond=60
         surface.autoresizingMask=[.width,.height]; out.contentView=surface; surface.presentScene(avatar)
-        window=out; showVisitorCode(); out.orderFront(nil); panel.makeKeyAndOrderFront(nil)
+        window=out; showVisitorCode(); out.orderFront(nil)
+        if !serverMode || CommandLine.arguments.contains("--test-panel") { panel.makeKeyAndOrderFront(nil) }
     }
 
-    @objc func openVisitor() { send(["command":"visitors"]) }
+    @objc func openVisitor() {
+        if serverMode {
+            if let url = visitorURL, Date().timeIntervalSince1970 < visitorExpires {
+                NSWorkspace.shared.open(url)
+            } else {
+                status.stringValue = "Ожидаем свежий QR"
+            }
+            return
+        }
+        send(["command":"visitors"])
+    }
 
     func showVisitorCode() {
         visitorCard?.removeFromSuperview()
         guard let url=visitorURL, let surface=window?.contentView, !stopped,
+              visitorExpires == 0 || Date().timeIntervalSince1970 < visitorExpires,
               let filter=CIFilter(name:"CIQRCodeGenerator") else { return }
         filter.setValue(Data(url.absoluteString.utf8),forKey:"inputMessage")
         filter.setValue("M",forKey:"inputCorrectionLevel")
         guard let code=filter.outputImage?.transformed(by:CGAffineTransform(scaleX:6,y:6)),
               let image=CIContext().createCGImage(code,from:code.extent) else {return}
         let card=NSView(frame:NSRect(x:16,y:16,width:188,height:184))
+        card.frame.origin.x = max(0,(surface.bounds.width-188)/2)
+        card.autoresizingMask = [.minXMargin,.maxXMargin,.maxYMargin]
         card.wantsLayer=true; card.layer?.backgroundColor=NSColor.white.cgColor
         let qr=NSImageView(frame:NSRect(x:29,y:42,width:130,height:130))
         qr.image=NSImage(cgImage:image,size:code.extent.size); qr.imageScaling = .scaleProportionallyUpOrDown
@@ -223,6 +253,13 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func resetMap() { scale.doubleValue=0.9; horizontal.doubleValue=0; vertical.doubleValue=0; calibrate() }
 
     func launchWorker() {
+        worker.currentDirectoryURL=root
+        if offline {
+            var environment = ProcessInfo.processInfo.environment
+            environment["POPOV_LOCAL_SERVER"] = "0"
+            environment["POPOV_SERVER_URL"] = ""
+            worker.environment = environment
+        }
         worker.executableURL=root.appendingPathComponent(".venv/bin/python")
         worker.arguments=["-u",root.appendingPathComponent("Исходники/service.py").path]
         worker.standardInput=commands; worker.standardOutput=responses
@@ -247,7 +284,7 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     (Int(bytes.loadUnaligned(as:UInt32.self).bigEndian),
                      Int(bytes.loadUnaligned(fromByteOffset:4,as:UInt32.self).bigEndian))
                 }
-                guard lengths.0 <= 2_000_000, lengths.1 <= 2_000_000,
+                guard lengths.0 <= 2_000_000, lengths.1 <= 6_000_000,
                       let header = read(lengths.0), let pcm = read(lengths.1),
                       let message = (try? JSONSerialization.jsonObject(with:header)) as? Message else { break }
                 DispatchQueue.main.async { self.handle(message,pcm:pcm) }
@@ -295,7 +332,8 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case "ready": ready=true; sendButton.isEnabled = !stopped; if !stopped { status.stringValue="Готов к реплике" }
         case "visitors":
             guard let link=msg["url"] as? String, let url=URL(string:link) else {return}
-            visitorURL=url; visitorLink.stringValue=link; showVisitorCode()
+            visitorURL=url; visitorLink.stringValue=(url.host ?? "")
+            visitorExpires=msg["expires_at"] as? Double ?? 0; showVisitorCode()
             if let warning=msg["warning"] as? String, !warning.isEmpty { status.stringValue=warning }
             if msg["open"] as? Bool == true, let address=msg["preview"] as? String, let preview=URL(string:address) {
                 NSWorkspace.shared.open(preview)

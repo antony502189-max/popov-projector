@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 
-SOCKET_DIR = Path(tempfile.gettempdir()) / f"popov-projector-{os.getuid()}"
+SOCKET_DIR = Path(tempfile.gettempdir()) / f"popov-projector-{getattr(os, 'getuid', lambda: 'local')()}"
 SOCKET = SOCKET_DIR / "control.sock"
 
 
@@ -69,10 +69,12 @@ class Player:
 
     def run(self):
         try:
-            from speech_core import SpeechCore, choose_answer
-            cache = PhraseCache(SpeechCore())
-            for question in ("Приёмник", "Кто вы?", "Что такое радио?", "Привет", "Спасибо", "?"):
-                cache.get(phrases(choose_answer(question))[0])
+            cache = None
+            if not os.getenv("POPOV_SERVER_URL"):
+                from speech_core import SpeechCore, choose_answer
+                cache = PhraseCache(SpeechCore())
+                for question in ("Приёмник", "Кто вы?", "Что такое радио?", "Привет", "Спасибо", "?"):
+                    cache.get(phrases(choose_answer(question))[0])
         except Exception as exc:
             with self.lock:
                 self.error = str(exc)
@@ -89,14 +91,22 @@ class Player:
                 self.active = key
             try:
                 if time.time() > expiry: raise ValueError("Истёк срок команды")
-                chunks = phrases(text)
                 record = self.history[key]
+                external = record.pop("external", None)
+                chunks = [text] if external else phrases(text)
                 for index, phrase in enumerate(chunks):
                     with self.lock:
                         self.lock.wait_for(lambda: self.active != key or
                                            index - record.get("played_chunks", 0) < 3)
                         if self.active != key: break
-                    pcm, track, cached = cache.get(phrase)
+                    if external:
+                        pcm, track = external
+                        cached = False
+                    else:
+                        if cache is None:
+                            from speech_core import SpeechCore
+                            cache = PhraseCache(SpeechCore())
+                        pcm, track, cached = cache.get(phrase)
                     if index + 1 < len(chunks):
                         pcm += bytes(2 * phrase_gap(phrase))
                     with self.lock:
@@ -121,7 +131,9 @@ class Player:
                         output(dict(type="abort", id=key, message=str(exc)))
 
     def cancel(self):
-        for key, *_ in self.tasks: self.history[key].update(state="cancelled", ended_at=time.monotonic())
+        for key, *_ in self.tasks:
+            self.history[key].pop("external", None)
+            self.history[key].update(state="cancelled", ended_at=time.monotonic())
         self.tasks.clear()
         if self.active: self.history[self.active].update(state="cancelled", ended_at=time.monotonic())
         self.active = None
@@ -133,6 +145,8 @@ class Player:
             key = msg.get("id", "")
             if not isinstance(key, str) or len(key) > 128: raise ValueError("Некорректный id")
             if cmd == "visitors":
+                if os.getenv("POPOV_SERVER_URL"):
+                    return {"message": "QR обновляется сервером автоматически"}
                 from visitor import network_warning, start, visitor_url
                 try:
                     if self.visitor_server is None:
@@ -210,12 +224,19 @@ class Player:
 
 def main():
     import fcntl
+    from remote import configure, start as start_remote
+    remote_mode = configure()
     SOCKET_DIR.mkdir(mode=0o700, exist_ok=True)
     if SOCKET_DIR.is_symlink() or SOCKET_DIR.stat().st_uid != os.getuid() or SOCKET_DIR.stat().st_mode & 0o077:
         raise RuntimeError("Недоступен закрытый каталог управления")
     guard = (SOCKET_DIR/"instance.lock").open("a")
     fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
     SOCKET.unlink(missing_ok=True)
+    local_api = None
+    if os.getenv("POPOV_LOCAL_SERVER") == "1":
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from server.local import LocalServer
+        local_api = LocalServer()
     player = Player()
     def request(raw, internal=False):
         try:
@@ -235,15 +256,22 @@ def main():
     os.chmod(SOCKET,0o600)
     threading.Thread(target=server.serve_forever,daemon=True).start()
     threading.Thread(target=player.run,daemon=True).start()
+    if remote_mode:
+        start_remote(player, output)
     try:
         for line in sys.stdin.buffer:
             result = request(line,True)
             if result.get("error"): output(dict(type="error",message=result["error"]))
     finally:
+        player.exit = True
+        with player.lock:
+            player.lock.notify_all()
         if player.visitor_server is not None:
             player.visitor_server.shutdown()
             player.visitor_server.server_close()
         server.server_close()
+        if local_api is not None:
+            local_api.close()
         SOCKET.unlink(missing_ok=True)
 
 if __name__ == "__main__": main()
