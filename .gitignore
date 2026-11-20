@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.app/
+.DS_Store
+*.blend1
+# Earlier local previews. The portable current scene and demo are published.
+/Установка проектора.blend
+/Проверка мимики.mp4

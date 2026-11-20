@@ -1,0 +1,6 @@
+# Источники
+
+- Исторический персонаж — Александр Степанович Попов. Проекция и реплики представляют музейную реконструкцию. Текст экскурсии написан для демонстрации. Описание когерера, реле, звонка и возврата прибора в исходное состояние опирается на [карточку Политехнического музея](https://polymus.ru/collection/detail/pribor-dlya-obnaruzheniya-i-registrirovaniya-elektricheskikh-kolebaniy).
+- Скульптурный референс портрета — **Alexander Stepanovich Popov**, HackSpace Taganrog. При подготовке сцены бюст адаптировался по масштабу, посадке и материалам. [Оригинальная работа](https://sketchfab.com/3d-models/alexander-stepanovich-popov-74e03ff919db4582af2553bac3c8c768) · [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+- Портрет в пульте — художественная 2D-реконструкция с подготовленными положениями губ и век. Референсы образа включают [фотографии из архива Е. Ю. Рыбкиной](https://radi0.ru/foto-i-video/fotografii-iz-lichnogo-arhiva-e-yu-rybkinoj/). Для фасада использованы визуальные материалы исходного проекта «Город говорит».
+- Речевой движок — [eSpeak NG](https://github.com/espeak-ng/espeak-ng). Для этой сборки его библиотека и словари устанавливаются из колеса [piper-tts](https://pypi.org/project/piper-tts/). Также используются NumPy и, при экспорте MP4, imageio-ffmpeg. У сторонних компонентов собственные лицензии.
