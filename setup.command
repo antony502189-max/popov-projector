@@ -7,6 +7,7 @@ if ! command -v "$python_bin" >/dev/null; then
   exit 1
 fi
 "$python_bin" -m venv .venv
-.venv/bin/python -m pip install --only-binary=:all: --no-deps -r requirements.txt
+.venv/bin/python -m pip install --only-binary=:all: -r requirements.txt
+.venv/bin/python Исходники/install_voice.py
 .venv/bin/python -c 'import sys; sys.path.insert(0,"Исходники"); from speech_core import SpeechCore; SpeechCore().synthesize("Проверка.")'
 ./Исходники/build.command

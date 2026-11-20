@@ -1,11 +1,11 @@
-"""Rule-based Russian audio, phonemes and facial dynamics. No inference runtime."""
+"""Local Russian speech and facial dynamics driven by the same PCM clock."""
 import argparse
-import ctypes as ct
+from difflib import SequenceMatcher
 import io
 import json
 from pathlib import Path
 import re
-import sysconfig
+from itertools import groupby
 import wave
 
 import numpy as np
@@ -13,17 +13,6 @@ import numpy as np
 from narration import phrases, phrase_gap
 
 
-class EventID(ct.Union):
-    _fields_ = [("number", ct.c_int), ("name", ct.c_void_p), ("phone", ct.c_char * 8)]
-
-
-class Event(ct.Structure):
-    _fields_ = [("type", ct.c_int), ("uid", ct.c_uint), ("pos", ct.c_int),
-                ("length", ct.c_int), ("ms", ct.c_int), ("sample", ct.c_int),
-                ("user", ct.c_void_p), ("id", EventID)]
-
-
-Callback = ct.CFUNCTYPE(ct.c_int, ct.POINTER(ct.c_short), ct.c_int, ct.POINTER(Event))
 GROUPS = {
     "rest": ("", "m", "b", "p"), "round": tuple("ouɔʊʉɵœøw"),
     "wide": tuple("ieɪɛɨyj"), "open": tuple("aɑæ"), "reduced": tuple("ɐʌəɘɜ"),
@@ -31,11 +20,10 @@ GROUPS = {
 }
 MOUTHS = {p: name for name, phones in GROUPS.items() for p in phones}
 FPS = 50
-# A performed voice for the exhibition. Values use the eSpeak parameter scale.
-VOICE = b"ru+m3"
-RATE_WPM = 122
-PITCH = 46
-PITCH_RANGE = 34
+MODEL = Path(__file__).resolve().parents[1] / "Голос" / "ru_RU-denis-medium.onnx"
+# Length, acoustic variation, and duration variation in the trained Piper voice.
+DELIVERY = {"спокойно": (1.12, .48, .30), "с интересом": (1.05, .58, .39)}
+DIRECTION = re.compile(r"^\[(спокойно|с интересом)\]\s*", re.I)
 SCIENCE_TOPIC = re.compile(r"\b(?:опыт|физик|эксперимент|при[её]мник|радиоволн|антенн|сигнал)\w*", re.I)
 
 
@@ -120,55 +108,80 @@ def dynamics(samples, rate, phones, marked):
 class SpeechCore:
     """One instance per process, called serially from the synthesis worker."""
     def __init__(self):
-        data = Path(sysconfig.get_path("platlib"))/"piper"
-        # This installed extension also exports the plain eSpeak C ABI. Loading it
-        # directly avoids importing Piper, ONNX or any trained voice model.
-        self.lib = ct.CDLL(str(data/"espeakbridge.so"))
-        self.lib.espeak_Initialize.argtypes = [ct.c_int,ct.c_int,ct.c_char_p,ct.c_int]
-        self.lib.espeak_Synth.argtypes = [ct.c_char_p,ct.c_size_t,ct.c_uint,ct.c_int,
-                                          ct.c_uint,ct.c_uint,ct.c_void_p,ct.c_void_p]
-        self.lib.espeak_SetSynthCallback.argtypes = [Callback]
-        self.lib.espeak_SetSynthCallback.restype = None
-        self.rate = self.lib.espeak_Initialize(2,30,str(data).encode(),3)
-        if self.rate <= 0 or self.lib.espeak_SetVoiceByName(VOICE) != 0:
-            raise RuntimeError("Не удалось открыть формантный русский голос eSpeak NG.")
-        for parameter,value in [(1, RATE_WPM), (2, 85), (3, PITCH)]:
-            if self.lib.espeak_SetParameter(parameter,value,0):
-                raise RuntimeError("Не удалось настроить голос.")
-        self.callback = Callback(self._collect)
-        self.lib.espeak_SetSynthCallback(self.callback)
+        from piper import PiperVoice
+        from piper.config import SynthesisConfig
 
-    def _collect(self, buf, count, events):
-        if buf and count: self.pcm.extend(ct.string_at(buf,count*2))
-        if len(self.pcm)>self.rate*2*25:
-            self.too_long = True
-            return 1
-        i = 0
-        while events and events[i].type:
-            event = events[i]
-            if event.type == 1:
-                start = max(0,event.pos-1)
-                self.highlight = any(self.marked[start:start+event.length])
-            elif event.type == 7:
-                phone = event.id.phone.decode("utf-8","ignore")
-                self.phones.append((event.ms/1000,phone,self.highlight))
-            i += 1
-        return 0
+        if not MODEL.is_file():
+            raise RuntimeError("Установите русский голос с помощью setup.command.")
+        self.voice = PiperVoice.load(str(MODEL), include_alignments=True)
+        self.rate = self.voice.config.sample_rate
+        if self.rate != 22050:
+            raise RuntimeError("Для пульта требуется голос с частотой 22 050 Гц.")
+        self.profiles = {
+            name: SynthesisConfig(length_scale=length, noise_scale=noise,
+                                  noise_w_scale=width, volume=.82)
+            for name, (length, noise, width) in DELIVERY.items()
+        }
+
+    def _highlights(self, plain, marked, symbols):
+        # Align phonemes of marked text runs to the actual contextual reading.
+        flags = [False] * len(symbols)
+        if not any(marked):
+            return flags
+        reference, emphasis = [], []
+        for selected, group in groupby(zip(plain, marked), key=lambda item: item[1]):
+            run = "".join(char for char, _ in group).strip()
+            if run:
+                phones = [p for sentence in self.voice.phonemize(run) for p in sentence]
+                reference.extend(phones)
+                emphasis.extend([selected] * len(phones))
+        matcher = SequenceMatcher(None, reference, symbols, autojunk=False)
+        for source, target, count in matcher.get_matching_blocks():
+            flags[target:target + count] = emphasis[source:source + count]
+        return flags
 
     def synthesize_pcm(self, text):
-        plain,self.marked = marked_text(text)
-        self.highlight = self.too_long = False
-        self.pcm = bytearray()
-        self.phones = []
-        # A small increase in melodic range on an explanation, at the same pace.
-        pitch_range = PITCH_RANGE + (5 if SCIENCE_TOPIC.search(plain) else 0)
-        if self.lib.espeak_SetParameter(4, pitch_range, 0):
-            raise RuntimeError("Не удалось настроить интонацию.")
-        utf8 = plain.encode()
-        result = self.lib.espeak_Synth(utf8,len(utf8)+1,0,1,0,1,None,None)
-        if self.too_long: raise ValueError("Реплика длиннее 25 секунд.")
-        if result or not self.pcm or not self.phones: raise ValueError("Не удалось озвучить реплику.")
-        signal,track = dynamics(np.frombuffer(self.pcm,dtype="<i2"),self.rate,self.phones,self.marked)
+        direction = DIRECTION.match(text.strip())
+        if direction:
+            text = text.strip()[direction.end():]
+        plain, marked = marked_text(text)
+        style = direction[1].lower() if direction else (
+            "с интересом" if SCIENCE_TOPIC.search(plain) else "спокойно")
+        blocks, symbols, starts = [], [], []
+        cursor = 0
+        for chunk in self.voice.synthesize(plain, self.profiles[style], include_alignments=True):
+            align = chunk.phoneme_alignments
+            if not align:
+                raise RuntimeError("Модель голоса не вернула длительности фонем.")
+            signal = np.frombuffer(chunk.audio_int16_bytes, dtype="<i2")
+            # Leave breathing room around speech and remove the model's variable
+            # silent padding. All phoneme offsets use the same crop as the waveform.
+            audible = np.flatnonzero(np.abs(signal.astype(np.int32)) > 70)
+            if not len(audible):
+                continue
+            start = max(0, int(audible[0]) - round(.035 * self.rate))
+            end = min(len(signal), int(audible[-1]) + round(.075 * self.rate))
+            lengths = np.array([p.num_samples for p in align], dtype=np.int64)
+            if lengths.sum() <= 0:
+                raise RuntimeError("Пустая разметка голоса.")
+            bounds = np.rint(np.r_[0, lengths.cumsum()] * len(signal) / lengths.sum()).astype(int)
+            for item, left, right in zip(align, bounds, bounds[1:]):
+                if min(end, right) > max(start, left):
+                    starts.append((cursor + max(0, left - start)) / self.rate)
+                    symbols.append(item.phoneme)
+            blocks.append(signal[start:end])
+            cursor += end - start
+        if not blocks:
+            raise ValueError("В тексте нет произносимых слов.")
+        highlights = self._highlights(plain, marked, symbols)
+        phones = []
+        for i, symbol in enumerate(symbols):
+            if symbol in ("ˈ", "ˌ") and i+1 < len(symbols):
+                symbol += symbols[i+1]
+            elif symbol in ("^", "$", " ") or symbol in ".,!?—:;-…":
+                symbol = ""
+            phones.append((starts[i], symbol, highlights[i]))
+        signal, track = dynamics(np.concatenate(blocks), self.rate, phones, marked)
         return signal.tobytes(), track
 
     def synthesize(self, text):

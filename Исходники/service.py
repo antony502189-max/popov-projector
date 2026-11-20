@@ -1,4 +1,4 @@
-"""Trusted, local text input and persistent formant synthesizer for the projector."""
+"""Trusted, local text input and persistent Russian speech model for the projector."""
 import struct
 from narration import MAX_TEXT, MAX_WIRE, phrases, phrase_gap
 from collections import OrderedDict, deque
