@@ -50,6 +50,6 @@ def phrases(text):
 def phrase_gap(phrase, rate=22050):
     # eSpeak omits sentence-final silence in synchronous retrieval mode.
     end = phrase.rstrip('*»”" ').rstrip()
-    if end.endswith((".", "!", "?", "…")): return round(rate * .24)
+    if end.endswith((".", "!", "?", "…")): return round(rate * .36)
     if end.endswith((",", ";", ":", "—")): return round(rate * .10)
     return round(rate * .025)

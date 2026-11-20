@@ -10,6 +10,8 @@ import wave
 
 import numpy as np
 
+from narration import phrases, phrase_gap
+
 
 class EventID(ct.Union):
     _fields_ = [("number", ct.c_int), ("name", ct.c_void_p), ("phone", ct.c_char * 8)]
@@ -29,6 +31,12 @@ GROUPS = {
 }
 MOUTHS = {p: name for name, phones in GROUPS.items() for p in phones}
 FPS = 50
+# A performed voice for the exhibition. Values use the eSpeak parameter scale.
+VOICE = b"ru+m3"
+RATE_WPM = 122
+PITCH = 46
+PITCH_RANGE = 34
+SCIENCE_TOPIC = re.compile(r"\b(?:опыт|физик|эксперимент|при[её]мник|радиоволн|антенн|сигнал)\w*", re.I)
 
 
 def marked_text(text):
@@ -87,7 +95,7 @@ def dynamics(samples, rate, phones, marked):
             accent = np.maximum(accent, beat * (.95 if highlight else .30))
         if highlight and bare:
             # Ramp the word gain at either end to avoid clicks.
-            gain = np.maximum(gain,1+.18*np.clip(np.minimum(
+            gain = np.maximum(gain,1+.12*np.clip(np.minimum(
                 (centers-start+.035)/.035,(end+.045-centers)/.045),0,1))
     signal = samples.astype(np.float64)
     if any(marked):
@@ -122,9 +130,9 @@ class SpeechCore:
         self.lib.espeak_SetSynthCallback.argtypes = [Callback]
         self.lib.espeak_SetSynthCallback.restype = None
         self.rate = self.lib.espeak_Initialize(2,30,str(data).encode(),3)
-        if self.rate <= 0 or self.lib.espeak_SetVoiceByName(b"ru") != 0:
+        if self.rate <= 0 or self.lib.espeak_SetVoiceByName(VOICE) != 0:
             raise RuntimeError("Не удалось открыть формантный русский голос eSpeak NG.")
-        for parameter,value in [(1,143),(2,85),(3,40),(4,39)]:
+        for parameter,value in [(1, RATE_WPM), (2, 85), (3, PITCH)]:
             if self.lib.espeak_SetParameter(parameter,value,0):
                 raise RuntimeError("Не удалось настроить голос.")
         self.callback = Callback(self._collect)
@@ -152,6 +160,10 @@ class SpeechCore:
         self.highlight = self.too_long = False
         self.pcm = bytearray()
         self.phones = []
+        # A small increase in melodic range on an explanation, at the same pace.
+        pitch_range = PITCH_RANGE + (5 if SCIENCE_TOPIC.search(plain) else 0)
+        if self.lib.espeak_SetParameter(4, pitch_range, 0):
+            raise RuntimeError("Не удалось настроить интонацию.")
         utf8 = plain.encode()
         result = self.lib.espeak_Synth(utf8,len(utf8)+1,0,1,0,1,None,None)
         if self.too_long: raise ValueError("Реплика длиннее 25 секунд.")
@@ -160,7 +172,32 @@ class SpeechCore:
         return signal.tobytes(), track
 
     def synthesize(self, text):
-        pcm, track = self.synthesize_pcm(text)
+        # Offline takes follow the same phrase boundaries and pauses as the player.
+        marked_text(text)
+        chunks = phrases(text)
+        pcm = bytearray()
+        cues = []
+        segments = []
+        for index, phrase in enumerate(chunks):
+            audio, local = self.synthesize_pcm(phrase)
+            offset = len(pcm) / (2 * self.rate)
+            pcm.extend(audio)
+            end = len(pcm) / (2 * self.rate)
+            segments.append((offset, end, local))
+            cues.extend([offset + a, offset + b, pose] for a, b, pose in local["cues"])
+            if index + 1 < len(chunks):
+                pcm.extend(bytes(2 * phrase_gap(phrase, self.rate)))
+                cues.append([end, len(pcm) / (2 * self.rate), "rest"])
+        seconds = len(pcm) / (2 * self.rate)
+        frames = np.arange(int(np.ceil(seconds * FPS)) + 1) / FPS
+        track = dict(cues=cues, fps=FPS, seconds=seconds)
+        for key in ("energy", "accent"):
+            curve = np.zeros(len(frames))
+            for start, end, local in segments:
+                active = (frames >= start) & (frames < end)
+                curve[active] = np.interp((frames[active] - start) * FPS,
+                                          np.arange(len(local[key])), local[key])
+            track[key] = curve.round(4).tolist()
         stream = io.BytesIO()
         with wave.open(stream,"wb") as out:
             out.setparams((1,2,self.rate,0,"NONE","PCM"))
