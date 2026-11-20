@@ -133,18 +133,23 @@ class Player:
             key = msg.get("id", "")
             if not isinstance(key, str) or len(key) > 128: raise ValueError("Некорректный id")
             if cmd == "visitors":
-                from visitor import start, visitor_url
+                from visitor import network_warning, start, visitor_url
                 try:
                     if self.visitor_server is None:
                         self.visitor_server = start(self, os.environ.get("POPOV_VISITOR_BIND", "0.0.0.0"),
-                                                    int(os.environ.get("POPOV_VISITOR_PORT", "8765")))
+                                                    int(os.environ["POPOV_VISITOR_PORT"]) if "POPOV_VISITOR_PORT" in os.environ else None)
                     url = visitor_url(self.visitor_server)
                 except (OSError, ValueError) as exc:
                     message = "Не удалось открыть вход для посетителей: " + str(exc)
                     if internal: output(dict(type="error", message=message))
                     raise ValueError(message) from exc
-                output(dict(type="visitors", url=url, open=internal))
-                return {"url": url}
+                host, port = self.visitor_server.server_address
+                if host == "0.0.0.0":
+                    host = "127.0.0.1"
+                preview = f"http://{host}:{port}/popov.html"
+                warning = network_warning()
+                output(dict(type="visitors", url=url, preview=preview, warning=warning, open=internal))
+                return {"url": url, "preview": preview, "warning": warning}
             if cmd == "status": return self.status()
             if cmd == "event":
                 record = self.history.get(key)

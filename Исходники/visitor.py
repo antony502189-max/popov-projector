@@ -1,6 +1,7 @@
 """Visitor-only HTTP interface of the local projector. Session data lives in RAM."""
 from email.parser import BytesParser
 from email.policy import default
+import errno
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
@@ -224,10 +225,32 @@ class VisitorHandler(BaseHTTPRequestHandler):
     do_POST = do_GET
 
 
+def network_warning():
+    firewall = Path("/usr/libexec/ApplicationFirewall/socketfilterfw")
+    if firewall.exists():
+        try:
+            result = subprocess.run([str(firewall), "--getglobalstate"], capture_output=True,
+                                    text=True, timeout=1)
+            if "State = 2" in result.stdout:
+                return "Брандмауэр блокирует вход с телефона. На Mac доступен предпросмотр."
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return ""
+
+
 def start(player, host, port):
     if not (WEB / "popov.html").is_file():
         raise ValueError("Мобильное приложение не установлено. Запустите setup.command.")
-    server = ThreadingHTTPServer((host, port), VisitorHandler)
+    class StationHTTP(ThreadingHTTPServer):
+        allow_reuse_address = False
+        allow_reuse_port = False
+
+    try:
+        server = StationHTTP((host, 18776 if port is None else port), VisitorHandler)
+    except OSError as exc:
+        if port is not None or exc.errno != errno.EADDRINUSE:
+            raise
+        server = StationHTTP((host, 0), VisitorHandler)
     server.visitors = Visitors(player)
     server.assets = {"/" + file.relative_to(WEB).as_posix(): file for file in WEB.rglob("*")
                      if file.is_file() and not file.name.startswith(".")}

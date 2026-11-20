@@ -296,7 +296,10 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case "visitors":
             guard let link=msg["url"] as? String, let url=URL(string:link) else {return}
             visitorURL=url; visitorLink.stringValue=link; showVisitorCode()
-            if msg["open"] as? Bool == true { NSWorkspace.shared.open(url) }
+            if let warning=msg["warning"] as? String, !warning.isEmpty { status.stringValue=warning }
+            if msg["open"] as? Bool == true, let address=msg["preview"] as? String, let preview=URL(string:address) {
+                NSWorkspace.shared.open(preview)
+            }
         case "stop": blackout()
         case "interrupt": clearAudio()
         case "abort":
