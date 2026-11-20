@@ -31,6 +31,8 @@ class Provider:
     def __init__(self):
         self.key = os.environ["LLM_API_KEY"]
         self.base = os.getenv("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/")
+        from .piper_voice import DenisVoice
+        self.denis = DenisVoice()
 
     def post(self, path, **kwargs):
         for attempt in range(3):
@@ -75,7 +77,11 @@ class Provider:
         return answer
 
     def speech(self, text, language, voice):
-        backend = os.getenv("TTS_BACKEND", "auto")
+        backend = os.getenv("TTS_BACKEND", "piper")
+        if backend == "piper" and language == "ru":
+            return self.denis.speech(text)
+        if backend == "piper":
+            backend = "auto"
         if backend == "windows":
             return audio_payload(windows_speech(text, language))
         if backend == "auto" and os.name == "nt" and language in ("ru", "en"):

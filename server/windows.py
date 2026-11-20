@@ -13,7 +13,19 @@ from urllib.request import Request, build_opener, ProxyHandler
 import wave
 import webbrowser
 
+from .avatar_motion import Motion, mesh
+
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def projection_layout(width, height, aspect):
+    """A large centered cutout and a quiet, scanable QR outside its silhouette."""
+    margin = max(18, round(min(width, height)*.025))
+    qr = max(132, min(220, round(min(width, height)*.22)))
+    actor_h = int(height*.97)
+    actor_w = int(actor_h*aspect)
+    return {"actor_size": (actor_w, actor_h), "actor_center": (width*.5, height*.505),
+            "qr_size": qr, "qr_center": (width-margin-qr/2, height-margin-qr/2)}
 
 
 def wav_bytes(pcm, sample_rate=22050):
@@ -98,36 +110,37 @@ class Projector:
         self.tk, self.Image, self.ImageTk = tk, Image, ImageTk
         self.host = host
         self.root = tk.Tk()
-        self.root.title("Попов · Сервер и проекция")
+        self.root.title("Попов · Проекция")
         self.root.configure(bg="black")
         screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         self.root.geometry(f"{max(480, screen_w//2)}x{max(550, screen_h-85)}+0+0")
         self.root.minsize(450, 500)
         self.root.bind("<F11>", self.fullscreen)
         self.root.bind("<Escape>", lambda e: self.root.attributes("-fullscreen", False))
+        self.root.bind("<F2>", lambda e: self.open_controls())
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        toolbar = tk.Frame(self.root, bg="#172b23", padx=12, pady=8)
-        toolbar.pack(fill="x")
-        tk.Label(toolbar, text="ПОПОВ · ПРОЕКЦИЯ", bg="#172b23", fg="#dbe4d4", font=("Segoe UI", 10, "bold")).pack(side="left")
-        tk.Button(toolbar, text="Открыть чат ↗", command=self.open_chat, bg="#e5ecdc", fg="#22422e", relief="flat", padx=12, pady=5).pack(side="right")
-        tk.Button(toolbar, text="Полный экран", command=self.fullscreen, bg="#243e31", fg="#edf1e8", relief="flat", padx=10, pady=5).pack(side="right", padx=7)
         self.canvas = tk.Canvas(self.root, bg="black", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
-        self.images = {name: Image.open(ROOT/"Ресурсы"/(name+".png")).convert("RGBA")
-                       for name in ("rest", "open", "soft", "round", "wide", "teeth", "hush", "reduced")}
+        names = ("rest", "open", "soft", "round", "wide", "teeth", "hush", "reduced", "blink", "brow")
+        originals = {name: Image.open(ROOT/"Ресурсы"/(name+".png")).convert("RGBA") for name in names}
+        bounds = originals["rest"].getbbox()
+        self.images = {name: img.crop(bounds) for name, img in originals.items()}
+        self.eye_band = ((originals["rest"].height*.065-bounds[1])/self.images["rest"].height,
+                         (originals["rest"].height*.13-bounds[1])/self.images["rest"].height)
+        self.motion = Motion()
+        self.motion_clock = time.perf_counter()
         self.cached = {}
         self.current_size = None
         self.current_pose = None
         self.actor = self.canvas.create_image(0, 0)
-        self.qr_item = self.canvas.create_image(0, 0, anchor="s")
-        self.caption = self.canvas.create_text(0, 0, fill="white", font=("Segoe UI", 12), anchor="s")
-        self.hint = self.canvas.create_text(0, 0, fill="#a9b6af", font=("Segoe UI", 10), anchor="nw")
-        self.answer = self.canvas.create_text(0, 0, fill="#e7eee9", font=("Segoe UI", 14), anchor="center")
+        self.qr_item = self.canvas.create_image(0, 0)
         self.qr_url, self.qr_until, self.qr_image = "", 0, None
         self.track, self.began, self.current = None, 0, None
         self.status = "Запускается сервер…"
         self.closing = False
+        self.controls = None
         self.host.thread.start()
+        self.open_controls()
         self.root.after(20, self.frame)
 
     def fullscreen(self, event=None):
@@ -138,6 +151,22 @@ class Projector:
             webbrowser.open(self.qr_url, new=1)
         else:
             self.status = "Ожидаем свежий QR — повторите через секунду"
+
+    def open_controls(self):
+        if self.controls and self.controls.winfo_exists():
+            self.controls.lift()
+            return
+        tk = self.tk
+        self.controls = tk.Toplevel(self.root)
+        self.controls.title("Попов · Тестирование")
+        self.controls.configure(bg="#e8f2ff")
+        self.controls.geometry("380x280+40+50")
+        tk.Label(self.controls, text="Тестирование проекции", bg="#e8f2ff", fg="#163b63", font=("Segoe UI", 16, "bold")).pack(pady=(24,12))
+        self.control_status = tk.StringVar(value=self.status)
+        tk.Label(self.controls, textvariable=self.control_status, bg="#e8f2ff", fg="#284c70", wraplength=330).pack(pady=4)
+        tk.Button(self.controls, text="Открыть разговор в браузере", command=self.open_chat, bg="#1164bd", fg="white", relief="flat", padx=18, pady=10).pack(pady=10)
+        tk.Button(self.controls, text="Полный экран / окно", command=self.fullscreen, bg="#d3e6ff", fg="#163b63", relief="flat", padx=18, pady=8).pack()
+        tk.Label(self.controls, text="F2 — это окно · F11 — полный экран\nEsc — вернуться к окну", bg="#e8f2ff", fg="#284c70").pack(pady=12)
 
     def show_qr(self, url, until):
         if url != self.qr_url:
@@ -163,7 +192,6 @@ class Projector:
         self.track = job["track"]
         self.began = time.perf_counter()
         self.status = "Попов говорит"
-        self.canvas.itemconfigure(self.answer, text=job["text"])
         def sound():
             import winsound
             try:
@@ -179,6 +207,7 @@ class Projector:
     def frame(self):
         if self.closing:
             return
+        frame_started = time.perf_counter()
         for _ in range(30):
             try:
                 kind, data = self.host.inbox.get_nowait()
@@ -196,9 +225,8 @@ class Projector:
             elif kind == "error":
                 self.status = data
         width, height = max(420, self.canvas.winfo_width()), max(440, self.canvas.winfo_height())
-        portrait_h = int(height*.85)
-        portrait_w = int(portrait_h*self.images["rest"].width/self.images["rest"].height)
-        size = (portrait_w, portrait_h)
+        layout = projection_layout(width, height, self.images["rest"].width/self.images["rest"].height)
+        size = layout["actor_size"]
         if self.current_size != size:
             self.cached.clear()
             self.current_size = size
@@ -208,25 +236,36 @@ class Projector:
         if pose not in self.images:
             pose = "soft"
         if pose not in self.cached:
-            self.cached[pose] = self.ImageTk.PhotoImage(self.images[pose].resize(size, self.Image.Resampling.LANCZOS))
-        self.canvas.itemconfigure(self.actor, image=self.cached[pose])
-        self.canvas.coords(self.actor, width*.5, height*.45)
-        qr_size = min(210, max(160, int(height*.23)))
+            self.cached[pose] = self.images[pose].resize(size, self.Image.Resampling.LANCZOS)
+        now = time.perf_counter()
+        state = self.motion.step(now-self.motion_clock, self.track, elapsed)
+        face = self.cached[pose].copy()
+        # Use the repository's actual eyelid/brow artwork, confined to its eye band.
+        band = (0, max(0, round(size[1]*self.eye_band[0])), size[0], round(size[1]*self.eye_band[1]))
+        for layer, strength in (("brow", state[5]), ("blink", state[4])):
+            if strength > .01:
+                if layer not in self.cached:
+                    self.cached[layer] = self.images[layer].resize(size, self.Image.Resampling.LANCZOS)
+                face.paste(self.Image.blend(face.crop(band), self.cached[layer].crop(band), strength), band)
+        pad = max(12, round(size[1]*.035))
+        padded = self.Image.new("RGBA", (size[0]+2*pad, size[1]+2*pad))
+        padded.paste(face, (pad,pad))
+        animated = padded.transform(padded.size, self.Image.Transform.MESH,
+                                    mesh(*size, pad, state), self.Image.Resampling.BILINEAR)
+        self.actor_photo = self.ImageTk.PhotoImage(animated)
+        self.canvas.itemconfigure(self.actor, image=self.actor_photo)
+        self.canvas.coords(self.actor, *layout["actor_center"])
+        qr_size = layout["qr_size"]
         if self.qr_image is not None and time.time() < self.qr_until:
             if not getattr(self, "qr_photo", None) or self.qr_photo.width() != qr_size:
                 self.qr_photo = self.ImageTk.PhotoImage(self.qr_image.resize((qr_size, qr_size), self.Image.Resampling.NEAREST))
             self.canvas.itemconfigure(self.qr_item, image=self.qr_photo, state="normal")
-            self.canvas.coords(self.qr_item, width*.5, height-49)
-            self.canvas.itemconfigure(self.caption, text="Спросить Попова · QR обновляется каждые 2 минуты")
+            self.canvas.coords(self.qr_item, *layout["qr_center"])
         else:
             self.canvas.itemconfigure(self.qr_item, state="hidden")
-            self.canvas.itemconfigure(self.caption, text="Ожидаем свежий QR…")
-        self.canvas.coords(self.caption, width*.5, height-23)
-        self.canvas.coords(self.hint, 18, 16)
-        self.canvas.itemconfigure(self.hint, text=self.status+"\nF11 — полный экран · Esc — выйти из полного экрана\n"+self.host.api.public_url)
-        self.canvas.coords(self.answer, width*.5, height*.60)
-        self.canvas.itemconfigure(self.answer, width=int(width*.85), state="hidden" if width < 900 else "normal")
-        self.root.after(33, self.frame)
+        if self.controls and self.controls.winfo_exists():
+            self.control_status.set(self.status+"\n"+self.host.api.public_url)
+        self.root.after(max(1, round(1000/30-(time.perf_counter()-frame_started)*1000)), self.frame)
 
     def close(self):
         self.closing = True
@@ -245,6 +284,14 @@ def main():
         raise RuntimeError("This renderer requires Windows")
     from .configure_local import configure
     from .local import LocalServer
+    # pythonw has no console: keep worker failures available for diagnosis.
+    import logging
+    from logging.handlers import RotatingFileHandler
+    (ROOT / "work").mkdir(exist_ok=True)
+    handler = RotatingFileHandler(ROOT / "work" / "server.log", maxBytes=2_000_000,
+                                  backupCount=2, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.getLogger("popov").addHandler(handler)
     configure(ROOT)
     api = LocalServer(ROOT)
     try:

@@ -6,18 +6,20 @@ import ipaddress
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import secrets
 import sqlite3
 import threading
 import time
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, Form
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .providers import LANGUAGES, VOICES, Provider
 from .local import valid_public_url
+from .body_limit import BodyLimitMiddleware
 
 ROOT = Path(__file__).resolve().parents[1]
 TERMINAL = {"finished", "failed", "cancelled"}
@@ -57,6 +59,12 @@ class Store:
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
         if "error" not in columns:
             self.db.execute("ALTER TABLE jobs ADD COLUMN error TEXT NOT NULL DEFAULT ''")
+        session_columns = {row[1] for row in self.db.execute("PRAGMA table_info(sessions)")}
+        if "browser_hash" not in session_columns:
+            self.db.execute("ALTER TABLE sessions ADD COLUMN browser_hash TEXT NOT NULL DEFAULT ''")
+        if "spent" not in session_columns:
+            self.db.execute("ALTER TABLE sessions ADD COLUMN spent INTEGER NOT NULL DEFAULT 0")
+            self.db.execute("UPDATE sessions SET spent=(SELECT COUNT(*) FROM jobs WHERE jobs.session=sessions.id AND jobs.state='finished')")
         # A process restart cannot know whether an already delivered job was spoken.
         # Fail closed instead of replaying a public utterance.
         self.db.execute("UPDATE jobs SET state='failed',payload=NULL WHERE state NOT IN ('finished','failed','cancelled')")
@@ -100,24 +108,33 @@ def create_app(path=None, provider=None, secret=None, station_key=None, public_u
     def online():
         return heartbeat["online"] and time.time() - heartbeat["at"] < 10
 
+    cookie_name = "popov_browser"
+
+    def browser_hash(request, value):
+        agent = request.headers.get("user-agent", "")[:1024]
+        return hashlib.sha256((value + "\0" + agent).encode()).hexdigest()
+
     def session(request, allow_expired=False):
         token = request.headers.get("authorization", "").removeprefix("Bearer ")
         with store.lock:
             rows = store.rows("SELECT * FROM sessions WHERE id=?", (hashlib.sha256(token.encode()).hexdigest(),))
-        if not rows or (rows[0]["until"] <= time.time() and not allow_expired):
-            raise HTTPException(401, "Срок доступа истёк. Сканируйте свежий QR у проектора.")
+        cookie = request.cookies.get(cookie_name, "")
+        if not rows or not cookie or not hmac.compare_digest(rows[0]["browser_hash"], browser_hash(request, cookie)):
+            raise HTTPException(401, "Откройте разговор в том же браузере или сканируйте свежий QR у проектора.")
         return rows[0]
 
     def snapshot(s):
         with store.lock:
+            # Playback acknowledgement may have advanced spent since authentication.
+            s = store.rows("SELECT * FROM sessions WHERE id=?", (s["id"],))[0]
             jobs = store.rows("SELECT * FROM jobs WHERE session=? ORDER BY created,id", (s["id"],))
             queue = store.rows("SELECT id FROM jobs WHERE state NOT IN ('finished','failed','cancelled') ORDER BY created,id")
         order = [r["id"] for r in queue]
         turns = [{"key": j["key"], "question": j["question"], "state": j["state"],
                   "answer": j["answer"], "error": j["error"], "ahead": order.index(j["id"]) if j["id"] in order else 0} for j in jobs]
-        used = sum(j["state"] not in ("failed", "cancelled") for j in jobs)
+        used = s["spent"] + sum(j["state"] not in TERMINAL for j in jobs)
         return {"online": online(), "turns": turns, "remaining": max(0, 3-used),
-                "expires_at": s["until"], "can_send": s["until"] > time.time(), "server_time": time.time(),
+                "expires_at": None, "can_send": used < 3, "server_time": time.time(),
                 "language": s["language"], "voice": s["voice"]}
 
     def process():
@@ -126,7 +143,8 @@ def create_app(path=None, provider=None, secret=None, station_key=None, public_u
                 now = time.time()
                 # Bound database growth and stale jobs. Accepted speech may finish after QR expiry.
                 store.db.execute("DELETE FROM jobs WHERE created<? AND state IN ('finished','failed','cancelled')", (now-86400,))
-                store.db.execute("DELETE FROM sessions WHERE until<? AND id NOT IN (SELECT session FROM jobs)", (now-86400,))
+                # The three-question counter survives history retention. An admitted
+                # browser session is not revoked by QR rotation or a wall clock.
                 store.db.execute("UPDATE jobs SET state='failed',payload=NULL WHERE state NOT IN ('finished','failed','cancelled') AND created<?", (now-300,))
                 jobs = store.rows("SELECT j.*,s.language,s.voice FROM jobs j JOIN sessions s ON s.id=j.session WHERE j.state='generating' ORDER BY j.created LIMIT 1")
                 if not jobs:
@@ -158,6 +176,7 @@ def create_app(path=None, provider=None, secret=None, station_key=None, public_u
         worker.join(timeout=1)
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
+    app.add_middleware(BodyLimitMiddleware, max_bytes=10*1024*1024)
     app.state.store = store
 
     @app.exception_handler(HTTPException)
@@ -179,12 +198,12 @@ def create_app(path=None, provider=None, secret=None, station_key=None, public_u
         if request.method == "POST" and origin and origin.rstrip("/") != public_url:
             return JSONResponse({"error": "Откройте приложение площадки."}, status_code=403)
         length = request.headers.get("content-length", "0")
-        if not length.isdigit() or int(length) > 10*1024*1024:
+        if not re.fullmatch(r"[0-9]{1,18}", length) or int(length) > 10*1024*1024:
             return JSONResponse({"error": "Слишком большой запрос."}, status_code=413)
         response = await call_next(request)
-        response.headers.update({"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+        response.headers.update({"Cache-Control": "no-store", "Referrer-Policy": "strict-origin-when-cross-origin",
             "X-Content-Type-Options": "nosniff",
-            "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"})
+            "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://tile.openstreetmap.org; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"})
         return response
 
     def authenticate_station(request):
@@ -200,7 +219,7 @@ def create_app(path=None, provider=None, secret=None, station_key=None, public_u
         return {"online": online(), "languages": LANGUAGES, "voices": VOICES, "server_mode": True, "server_time": time.time()}
 
     @app.post("/api/start")
-    def start(data: Start):
+    def start(data: Start, request: Request, response: Response):
         if data.language not in LANGUAGES or data.voice not in VOICES:
             raise HTTPException(422, "Выберите доступный язык и голос.")
         with store.lock:
@@ -209,7 +228,15 @@ def create_app(path=None, provider=None, secret=None, station_key=None, public_u
             if not online():
                 raise HTTPException(503, "Проектор не на связи.")
             # Idempotent start: retries / reloads cannot reset the three-question quota.
-            identity = hashlib.sha256((data.admission + data.client_id).encode()).hexdigest()
+            cookie = request.cookies.get(cookie_name, "")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{40,100}", cookie):
+                cookie = secrets.token_urlsafe(32)
+            binding = browser_hash(request, cookie)
+            # The browser cookie, not a caller-controlled client_id or User-Agent
+            # alone, owns the quota for this QR admission window.
+            identity = hashlib.sha256((data.admission + binding).encode()).hexdigest()
+            response.set_cookie(cookie_name, cookie, httponly=True, secure=public_url.startswith("https://"),
+                                samesite="strict", path="/")
             token = sign("session:" + identity)
             sid = hashlib.sha256(token.encode()).hexdigest()
             existing = store.rows("SELECT * FROM sessions WHERE id=?", (sid,))
@@ -217,13 +244,15 @@ def create_app(path=None, provider=None, secret=None, station_key=None, public_u
                 return {"token": token, **snapshot(existing[0])}
             if len(store.rows("SELECT id FROM sessions WHERE until>?", (time.time(),))) >= 128:
                 raise HTTPException(429, "Сейчас много посетителей.")
-            store.db.execute("INSERT INTO sessions VALUES (?,?,?,?,?)", (sid, identity, (epoch()+1)*120, data.language, data.voice))
+            store.db.execute("INSERT INTO sessions(id,admission,until,language,voice,browser_hash,spent) VALUES (?,?,?,?,?,?,0)",
+                             (sid, identity, (epoch()+1)*120, data.language, data.voice, binding))
             s = store.rows("SELECT * FROM sessions WHERE id=?", (sid,))[0]
         return {"token": token, **snapshot(s)}
 
     @app.get("/api/session")
     def get_session(request: Request):
-        # Expired sessions can read accepted answers but can never send new questions.
+        # Access comes from the browser cookie plus bearer token; the QR deadline
+        # controls admission only. Existing visitors can use their three questions.
         return snapshot(session(request, allow_expired=True))
 
     @app.post("/api/question")
@@ -235,6 +264,8 @@ def create_app(path=None, provider=None, secret=None, station_key=None, public_u
         if not text:
             raise HTTPException(422, "Введите вопрос.")
         with store.lock:
+            # Read the quota in the same critical section as the job insertion.
+            s = store.rows("SELECT * FROM sessions WHERE id=?", (s["id"],))[0]
             previous = store.rows("SELECT * FROM jobs WHERE session=? AND key=?", (s["id"], data.key))
             if previous:
                 if previous[0]["question"] != text:
@@ -243,7 +274,7 @@ def create_app(path=None, provider=None, secret=None, station_key=None, public_u
             if not online():
                 raise HTTPException(503, "Проектор не на связи.")
             mine = store.rows("SELECT state FROM jobs WHERE session=?", (s["id"],))
-            used = sum(j["state"] not in ("failed", "cancelled") for j in mine)
+            used = s["spent"] + sum(j["state"] not in TERMINAL for j in mine)
             if used >= 3 or any(j["state"] not in TERMINAL for j in mine):
                 raise HTTPException(409, "Дождитесь ответа. В сессии доступно три вопроса.")
             if store.rows("SELECT COUNT(*) n FROM jobs WHERE state NOT IN ('finished','failed','cancelled')")[0]["n"] >= 6:
@@ -327,6 +358,8 @@ def create_app(path=None, provider=None, secret=None, station_key=None, public_u
                            "prepared": {"started", *TERMINAL}, "started": TERMINAL}
             if data.state != old and data.state not in transitions.get(old, set()):
                 raise HTTPException(409, "Invalid playback transition")
+            if data.state == "finished" and old != "finished":
+                store.db.execute("UPDATE sessions SET spent=spent+1 WHERE id=(SELECT session FROM jobs WHERE id=?)", (job_id,))
             store.db.execute("UPDATE jobs SET state=?,updated=?,payload=CASE WHEN ? THEN NULL ELSE payload END WHERE id=?",
                              (data.state, time.time(), data.state in TERMINAL, job_id))
         return {"ok": True}
@@ -341,7 +374,10 @@ def create_app(path=None, provider=None, secret=None, station_key=None, public_u
         if file.is_relative_to(root.resolve()) and file.is_file() and not any(
             part.startswith(".") for part in file.relative_to(root.resolve()).parts
         ):
-            return FileResponse(file)
+            # Windows MIME registry may label .mjs as text/plain. Module scripts
+            # require a JavaScript MIME type even when the content is correct.
+            kind = "text/javascript" if file.suffix.lower() in (".mjs", ".js") else None
+            return FileResponse(file, media_type=kind)
         raise HTTPException(404, "Страница не найдена.")
 
     return app

@@ -64,10 +64,15 @@ def admission(client):
 
 
 def start(client, code=None, identity="browser-identity-1", language="en", voice="nova"):
-    result = client.post("/api/start", json={"admission": code or admission(client),
+    browsers = getattr(client, "test_browsers", {})
+    cookie = browsers.get(identity, "")
+    result = client.post("/api/start", headers={"Cookie": cookie}, json={"admission": code or admission(client),
                          "client_id": identity, "language": language, "voice": voice})
     assert result.status_code == 200, result.text
-    return {"Authorization": "Bearer " + result.json()["token"]}
+    cookie = "popov_browser=" + result.cookies.get("popov_browser")
+    browsers[identity] = cookie
+    client.test_browsers = browsers
+    return {"Authorization": "Bearer " + result.json()["token"], "Cookie": cookie}
 
 
 def ask(client, user, key="question-1", text="How does radio work?"):
@@ -106,7 +111,7 @@ def test_full_question_speech_ack_and_history():
         assert c.provider.calls[2][1][0]["answer"] == job["text"]
 
 
-def test_qr_rotation_revokes_sending_and_old_code_but_keeps_reading():
+def test_qr_rotation_blocks_old_admission_but_preserves_existing_browser_session():
     with running() as c, patch("server.app.time.time", return_value=12001):
         code = admission(c)
         user = start(c, code)
@@ -114,9 +119,52 @@ def test_qr_rotation_revokes_sending_and_old_code_but_keeps_reading():
             fresh = admission(c)
             assert fresh != code
             assert c.post("/api/start", json={"admission": code, "client_id": "browser-identity-1"}).status_code == 401
-            assert ask(c, user).status_code == 401
-            assert c.get("/api/session", headers=user).json()["can_send"] is False
+            assert ask(c, user).status_code == 200
+            assert c.get("/api/session", headers=user).json()["expires_at"] is None
+            assert c.post("/api/transcribe", headers=user, files={"recording":("voice.wav",b"test")}).status_code == 200
             assert c.post("/api/start", json={"admission": fresh, "client_id": "browser-identity-1"}).status_code == 200
+
+
+def test_session_requires_original_cookie_and_user_agent():
+    with running() as c:
+        user = start(c)
+        assert c.get("/api/session", headers={**user, "Cookie": ""}).status_code == 401
+        assert c.get("/api/session", headers={**user, "User-Agent": "Another Phone"}).status_code == 401
+        assert c.get("/api/session", headers={**user, "Cookie": "popov_browser=" + "x"*43}).status_code == 401
+        assert c.get("/api/session", headers=user).status_code == 200
+
+
+def test_three_successful_questions_survive_qr_rotation_and_history_cleanup():
+    with running() as c:
+        user = start(c)
+        for index in range(3):
+            assert ask(c, user, key="question-"+str(index)).status_code == 200
+            job = wait_job(c)
+            assert c.post("/station/jobs/"+job["id"], headers=c.station, json={"state":"finished"}).status_code == 200
+            assert c.post("/station/jobs/"+job["id"], headers=c.station, json={"state":"finished"}).status_code == 200
+        assert c.get("/api/session", headers=user).json()["remaining"] == 0
+        c.app.state.store.db.execute("DELETE FROM jobs")
+        assert c.get("/api/session", headers=user).json()["remaining"] == 0
+        assert ask(c, user, key="question-4").status_code == 409
+
+
+def test_client_id_change_does_not_reset_browser_quota():
+    with running() as c:
+        code = admission(c)
+        user = start(c, code)
+        result = c.post("/api/start", headers={"Cookie": user["Cookie"]},
+                        json={"admission":code,"client_id":"different-client-id"})
+        assert result.status_code == 200
+        assert "Bearer " + result.json()["token"] == user["Authorization"]
+
+
+def test_browser_cookie_flags_and_plain_url_do_not_grant_access():
+    with running() as c:
+        result = c.post("/api/start", json={"admission":admission(c),"client_id":"browser-identity-1"})
+        header = result.headers["set-cookie"].lower()
+        assert "httponly" in header and "samesite=strict" in header and "path=/" in header
+        assert "max-age=" not in header
+        assert c.get("/api/session", headers={"Authorization":"Bearer copied-url"}).status_code == 401
 
 
 def test_auth_forgery_origin_and_offline():
@@ -196,7 +244,18 @@ def test_station_uses_mobile_shell_without_exposing_secrets():
         assert c.get("/.env").status_code == 404
         assert c.get("/station.env").status_code == 404
         assert c.get("/assets/popov.webp").status_code == 200
-        assert c.get("/popov.html").headers["referrer-policy"] == "no-referrer"
+        # Tile providers receive the site origin, never a QR fragment or path.
+        assert c.get("/popov.html").headers["referrer-policy"] == "strict-origin-when-cross-origin"
+        policy = c.get("/").headers["content-security-policy"]
+        assert "https://tile.openstreetmap.org" in policy.split("img-src ")[1].split(";")[0]
+
+
+def test_module_scripts_override_windows_plain_text_mime():
+    with running() as c, patch("mimetypes.guess_type", return_value=("text/plain", None)):
+        for path in ("/station.mjs", "/vendor/vue.esm-browser.prod.mjs", "/app.js"):
+            response = c.get(path)
+            assert response.status_code == 200
+            assert response.headers["content-type"].split(";")[0] == "text/javascript"
 
 
 def test_bridge_real_player_protocol(monkeypatch):

@@ -7,3 +7,7 @@ __pycache__
 **/__pycache__
 **/node_modules
 *.sqlite3*
+/work/
+/Голос/
+**/dist/
+**/qa/

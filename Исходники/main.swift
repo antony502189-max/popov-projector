@@ -227,11 +227,10 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
         filter.setValue("M",forKey:"inputCorrectionLevel")
         guard let code=filter.outputImage?.transformed(by:CGAffineTransform(scaleX:6,y:6)),
               let image=CIContext().createCGImage(code,from:code.extent) else {return}
-        let card=NSView(frame:NSRect(x:16,y:16,width:188,height:184))
-        card.frame.origin.x = max(0,(surface.bounds.width-188)/2)
-        card.autoresizingMask = [.minXMargin,.maxXMargin,.maxYMargin]
+        let card=NSView(frame:NSRect(x:max(16,surface.bounds.width-180),y:20,width:160,height:160))
+        card.autoresizingMask = [.minXMargin,.maxYMargin]
         card.wantsLayer=true; card.layer?.backgroundColor=NSColor.white.cgColor
-        let qr=NSImageView(frame:NSRect(x:29,y:42,width:130,height:130))
+        let qr=NSImageView(frame:NSRect(x:10,y:10,width:140,height:140))
         qr.image=NSImage(cgImage:image,size:code.extent.size); qr.imageScaling = .scaleProportionallyUpOrDown
         let caption=NSTextField(labelWithString:"Спросить Попова")
         caption.alignment = .center; caption.textColor = .black
@@ -240,7 +239,7 @@ final class Station: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let address=NSTextField(labelWithString:shortAddress)
         address.alignment = .center; address.textColor = .darkGray
         address.font = .systemFont(ofSize:10); address.frame=NSRect(x:2,y:4,width:184,height:16)
-        card.addSubview(qr);card.addSubview(caption);card.addSubview(address)
+        card.addSubview(qr)
         surface.addSubview(card);visitorCard=card
     }
 

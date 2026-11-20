@@ -8,3 +8,4 @@ edge-tts>=7,<8
 imageio-ffmpeg>=0.5,<1
 pillow>=11,<13
 qrcode>=8,<9
+piper-tts[alignment]==1.8.0

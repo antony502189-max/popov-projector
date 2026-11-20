@@ -19,7 +19,7 @@ def configure(root):
     defaults = {"LLM_BASE_URL": "https://api.deepseek.com", "LLM_MODEL": "deepseek-chat",
         "LLM_API_KEY": "replace-with-deepseek-key", "ASR_BASE_URL": "https://api.groq.com/openai/v1",
         "ASR_MODEL": "whisper-large-v3-turbo", "ASR_API_KEY": "replace-with-groq-key",
-        "TTS_BACKEND": "auto", "DATABASE": "work/popov.sqlite3", "POPOV_LOCAL_PORT": "18776",
+        "TTS_BACKEND": "piper", "DATABASE": "work/popov.sqlite3", "POPOV_LOCAL_PORT": "18776",
         "QR_SECRET": secrets.token_hex(32), "STATION_KEY": secrets.token_hex(32)}
     extra = "".join(f"{key}={value}\n" for key, value in defaults.items() if key not in keys)
     file.write_text(text.rstrip()+"\n"+extra, encoding="utf-8")
